@@ -1,29 +1,54 @@
 # Campusly — Campus Event Discovery
 
-A responsive campus events MVP based on `PLAN.md`. The frontend is a self-contained demo with browser storage; the Flask API implements planned event, recommendation, profile and registration flows.
+A responsive campus events application featuring student and admin authentication, SQLite database, and optional integration with Ollama AI (gemma3:4b).
 
-## Run the web app
+## Prerequisites
 
-Open `frontend/index.html` in a browser. Demo interactions and student state are stored locally in that browser.
+- Python 3.8+
+- SQLite3 (Included with Python)
+- (Optional) [Ollama](https://ollama.com/) with the `gemma3:4b` model installed
 
-## Run the Flask API
+## Run the Flask API (Backend)
 
-From `backend/`, install `requirements.txt`, then run `python app.py`. The API listens on `http://localhost:5000`.
+1. Navigate to the `backend/` directory:
+   ```bash
+   cd backend
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the application (This will automatically initialize `campusly.db`):
+   ```bash
+   python app.py
+   ```
+The API listens on `http://localhost:5000`.
 
-## API
+## Run the Web App (Frontend)
 
-- `GET /api/events` — published upcoming events
-- `GET /api/events/<event_id>` — event details
-- `GET /api/programs` — published campus programs
-- `GET /api/recommendations?uid=demo-student` — scored recommendations
-- `PUT /api/profile/interests` — update interests
-- `POST /api/events/<event_id>/register` — registration with duplicate and capacity checks
-- `GET /api/my-registrations?uid=demo-student` — registrations
-- `POST /api/admin/events` — create an event
-- `POST /api/admin/programs` — add and publish a campus program
-- `PUT /api/admin/events/<event_id>` — update an event
-- `POST /api/admin/events/<event_id>/cancel` — cancel an event
+Open `frontend/index.html` in a web browser. The frontend interacts directly with the local Flask API. 
+**Note**: It requires the backend to be running to fetch events and authenticate.
 
-## Demo limitations
+## Authentication
 
-No Firebase project or credentials were supplied. Browser state uses localStorage and API data is in memory. API admin routes are scaffolding only: add Firebase Authentication token verification, role checks, Firestore transactions and security rules before production. API event data resets when Flask restarts.
+- **Admin Login**: 
+  - Email: `admin`
+  - Password: `admin`
+  *(Note: This is for local development only and provides access to the Organizer Studio)*
+- **Student Login**: Use the Sign Up button to create a new student account.
+
+## Ollama AI Integration (Optional)
+
+The application includes AI-powered event recommendations, chat assistance, and summarization. 
+To enable this feature:
+
+1. Install and start Ollama locally.
+2. Run: `ollama run gemma3:4b`
+3. The backend will communicate with Ollama at `http://localhost:11434`. 
+If Ollama is not running, the application will gracefully fall back to local rule-based recommendations and logic.
+
+## Application Architecture
+
+- **Backend**: Flask + SQLite. Manages Users, Profiles, Events, Registrations, and Suggestions.
+- **Frontend**: Vanilla JavaScript (app.js, chatbot.js) and CSS. Communicates via REST APIs with JSON. 
+- **Database**: The local `campusly.db` handles all persistence securely. Password hashes are stored securely. 

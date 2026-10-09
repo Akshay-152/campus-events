@@ -1,91 +1,304 @@
+import os
+import json
+import secrets
 from datetime import date
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g, send_from_directory
 from flask_cors import CORS
-from recommender import recommend
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+import db
+import ai
 
 app = Flask(__name__)
-CORS(app)
-EVENTS = [
-    {"id":"e1","title":"AI & Innovation Summit","category":"AI","tags":["AI","Technology","Entrepreneurship"],"date":"2026-10-13","startTime":"10:00","endTime":"16:00","venue":"Innovation Hub · Hall A","organizer":"Computer Science Society","description":"A full day of ideas, demos, and conversations about how artificial intelligence is shaping the world around us.","capacity":180,"status":"published","department":"Computer Science"},
-    {"id":"e2","title":"Indie Night: Open Mic","category":"Music","tags":["Music","Arts","Community"],"date":"2026-10-15","startTime":"18:30","endTime":"21:00","venue":"The Courtyard","organizer":"Campus Arts Collective","description":"An easygoing evening for live music, spoken word, and good company.","capacity":120,"status":"published"},
-    {"id":"e3","title":"Campus 5K & Wellness Fair","category":"Sports","tags":["Sports","Wellness"],"date":"2026-10-17","startTime":"07:30","endTime":"11:30","venue":"North Gate","organizer":"Student Wellness Council","description":"Run, walk, or cheer. The morning wraps up with a wellness fair.","capacity":250,"status":"published"},
-]
-PROGRAMS = []
-PROFILES = {"demo-student":{"interests":["AI","Coding","Music","Entrepreneurship"],"department":"Computer Science","year":2}}
-REGISTRATIONS = set()
+CORS(app, supports_credentials=True)
+app.secret_key = "super_secret_dev_key"
+
+UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Simple in-memory session store (token -> dict with id, role, email)
+SESSIONS = {}
+
+def get_user_from_token():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    return SESSIONS.get(token)
+
+def login_required(f):
+    def wrapper(*args, **kwargs):
+        user = get_user_from_token()
+        if not user:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    wrapper.__name__ = f.__name__
+    return wrapper
+
+def admin_required(f):
+    def wrapper(*args, **kwargs):
+        user = get_user_from_token()
+        if not user or user.get('role') != 'admin':
+            return jsonify({'error': 'Admin required'}), 403
+        return f(*args, **kwargs)
+    wrapper.__name__ = f.__name__
+    return wrapper
+
+@app.route('/uploads/<name>')
+def download_file(name):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], name)
+
+@app.post('/api/auth/register')
+def register():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+    full_name = data.get('full_name')
+    
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+        
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT id FROM users WHERE email=?", (email,))
+    if c.fetchone():
+        return jsonify({'error': 'Email already registered'}), 409
+        
+    pwd_hash = generate_password_hash(password)
+    c.execute("INSERT INTO users (email, password_hash, role) VALUES (?, ?, ?)", (email, pwd_hash, 'student'))
+    user_id = c.lastrowid
+    
+    # Create empty profile
+    c.execute("INSERT INTO student_profiles (user_id, full_name, interests) VALUES (?, ?, ?)", (user_id, full_name, '[]'))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'ok': True}), 201
+
+@app.post('/api/auth/login')
+def login():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+    
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, email, password_hash, role FROM users WHERE email=?", (email,))
+    user = c.fetchone()
+    conn.close()
+    
+    if not user or not check_password_hash(user['password_hash'], password):
+        return jsonify({'error': 'Invalid credentials'}), 401
+        
+    token = secrets.token_hex(32)
+    SESSIONS[token] = {'id': user['id'], 'email': user['email'], 'role': user['role']}
+    
+    return jsonify({'token': token, 'role': user['role'], 'email': user['email']})
+
+@app.post('/api/auth/logout')
+def logout():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    if token in SESSIONS:
+        del SESSIONS[token]
+    return jsonify({'ok': True})
+
+@app.get('/api/profile')
+@login_required
+def get_profile():
+    user = get_user_from_token()
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM student_profiles WHERE user_id=?", (user['id'],))
+    profile = c.fetchone()
+    conn.close()
+    if not profile: return jsonify({'error': 'Profile not found'}), 404
+    
+    return jsonify({
+        'full_name': profile['full_name'],
+        'college_id': profile['college_id'],
+        'department': profile['department'],
+        'course': profile['course'],
+        'interests': json.loads(profile['interests'] or '[]')
+    })
+
+@app.put('/api/profile')
+@login_required
+def update_profile():
+    user = get_user_from_token()
+    data = request.json or {}
+    interests = json.dumps(data.get('interests', []))
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE student_profiles 
+        SET full_name=?, college_id=?, department=?, course=?, interests=?
+        WHERE user_id=?
+    """, (data.get('full_name'), data.get('college_id'), data.get('department'), data.get('course'), interests, user['id']))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 @app.get('/api/events')
-def events():
-    return jsonify([e for e in EVENTS if e['status']=='published' and e['date']>=date.today().isoformat()])
+def get_events():
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE status='published' AND event_date >= ?", (date.today().isoformat(),))
+    events = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return jsonify(events)
 
-@app.get('/api/programs')
-def programs():
-    return jsonify([p for p in PROGRAMS if p['status']=='published'])
+@app.get('/api/events/<int:event_id>')
+def get_event(event_id):
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE id=?", (event_id,))
+    event = c.fetchone()
+    conn.close()
+    return jsonify(dict(event)) if event else (jsonify({'error': 'Not found'}), 404)
 
-@app.get('/api/events/<event_id>')
-def event_detail(event_id):
-    event = next((e for e in EVENTS if e['id']==event_id), None)
-    return (jsonify(event), 200) if event else (jsonify({'error':'Event not found'}), 404)
-
-@app.get('/api/recommendations')
-def recommendations():
-    profile = PROFILES.get(request.args.get('uid','demo-student'), PROFILES['demo-student'])
-    return jsonify(recommend(EVENTS, profile))
-
-@app.put('/api/profile/interests')
-def update_interests():
-    data = request.get_json(silent=True) or {}
-    if not isinstance(data.get('interests'), list): return jsonify({'error':'interests must be a list'}), 400
-    PROFILES.setdefault(data.get('uid','demo-student'), {}).update({'interests':data['interests']})
-    return jsonify({'ok':True,'interests':data['interests']})
-
-@app.post('/api/events/<event_id>/register')
-def register(event_id):
-    uid = (request.get_json(silent=True) or {}).get('uid','demo-student')
-    event = next((e for e in EVENTS if e['id']==event_id), None)
-    if not event or event['status']!='published': return jsonify({'error':'Event unavailable'}), 404
-    if event.get('date','') < date.today().isoformat(): return jsonify({'error':'Event has passed'}), 400
-    key = (event_id, uid)
-    if key in REGISTRATIONS: return jsonify({'error':'Already registered'}), 409
-    if len([r for r in REGISTRATIONS if r[0]==event_id]) >= event.get('capacity',10**9): return jsonify({'error':'Event is full'}), 409
-    REGISTRATIONS.add(key)
-    return jsonify({'ok':True,'eventId':event_id}), 201
+@app.post('/api/events/<int:event_id>/register')
+@login_required
+def register_event(event_id):
+    user = get_user_from_token()
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE id=?", (event_id,))
+    event = c.fetchone()
+    if not event or event['status'] != 'published':
+        return jsonify({'error': 'Event unavailable'}), 404
+        
+    if event['event_date'] < date.today().isoformat():
+        return jsonify({'error': 'Event passed'}), 400
+        
+    c.execute("SELECT COUNT(*) as count FROM event_registrations WHERE event_id=?", (event_id,))
+    reg_count = c.fetchone()['count']
+    if event['capacity'] and reg_count >= event['capacity']:
+        return jsonify({'error': 'Event is full'}), 409
+        
+    try:
+        c.execute("INSERT INTO event_registrations (event_id, student_user_id) VALUES (?, ?)", (event_id, user['id']))
+        conn.commit()
+    except:
+        return jsonify({'error': 'Already registered'}), 409
+    finally:
+        conn.close()
+        
+    return jsonify({'ok': True})
 
 @app.get('/api/my-registrations')
+@login_required
 def my_registrations():
-    uid = request.args.get('uid','demo-student')
-    return jsonify([e for eid,u in REGISTRATIONS if u==uid for e in EVENTS if e['id']==eid])
+    user = get_user_from_token()
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("""
+        SELECT e.*, r.registration_status 
+        FROM events e 
+        JOIN event_registrations r ON e.id = r.event_id 
+        WHERE r.student_user_id=?
+    """, (user['id'],))
+    events = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return jsonify(events)
+
+@app.post('/api/event-suggestions')
+@login_required
+def create_suggestion():
+    user = get_user_from_token()
+    data = request.json or {}
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO event_suggestions (student_user_id, title, category, description, preferred_date, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (user['id'], data.get('title'), data.get('category'), data.get('description'), data.get('preferred_date'), data.get('reason')))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+@app.get('/api/admin/suggestions')
+@admin_required
+def admin_get_suggestions():
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM event_suggestions")
+    sugs = [dict(row) for row in c.fetchall()]
+    conn.close()
+    return jsonify(sugs)
 
 @app.post('/api/admin/events')
-def create_event():
-    data = request.get_json(silent=True) or {}
-    required = ('title','category','date','startTime','venue','description')
-    if any(not data.get(k) for k in required): return jsonify({'error':'Missing required event fields'}), 400
-    data.update(id='e'+str(len(EVENTS)+1), status='published', tags=data.get('tags',[data['category']]))
-    EVENTS.append(data)
-    return jsonify(data), 201
+@admin_required
+def admin_create_event():
+    user = get_user_from_token()
+    data = request.form.to_dict()
+    poster_path = None
+    if 'poster' in request.files:
+        file = request.files['poster']
+        if file.filename:
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            poster_path = f"/uploads/{filename}"
+            
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO events (title, description, category, poster_path, event_date, start_time, end_time, venue, organizer, capacity, registration_url, status, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        data.get('title'), data.get('description'), data.get('category'), poster_path,
+        data.get('event_date'), data.get('start_time'), data.get('end_time'), data.get('venue'),
+        data.get('organizer'), data.get('capacity'), data.get('registration_url'), 'published', user['id']
+    ))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True}), 201
 
-@app.post('/api/admin/programs')
-def create_program():
-    data = request.get_json(silent=True) or {}
-    if not data.get('title') or not data.get('description'):
-        return jsonify({'error':'Program title and description are required'}), 400
-    data.update(id='p'+str(len(PROGRAMS)+1), status='published')
-    PROGRAMS.append(data)
-    return jsonify(data), 201
+@app.put('/api/admin/events/<int:event_id>')
+@admin_required
+def admin_update_event(event_id):
+    data = request.json or {}
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("UPDATE events SET title=?, description=?, event_date=?, status=?, registration_url=? WHERE id=?", 
+              (data.get('title'), data.get('description'), data.get('event_date'), data.get('status'), data.get('registration_url'), event_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
-@app.put('/api/admin/events/<event_id>')
-def update_event(event_id):
-    event = next((e for e in EVENTS if e['id']==event_id), None)
-    if not event: return jsonify({'error':'Event not found'}), 404
-    event.update(request.get_json(silent=True) or {})
-    return jsonify(event)
+@app.delete('/api/admin/events/<int:event_id>')
+@admin_required
+def admin_delete_event(event_id):
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("DELETE FROM events WHERE id=?", (event_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
-@app.post('/api/admin/events/<event_id>/cancel')
-def cancel_event(event_id):
-    event = next((e for e in EVENTS if e['id']==event_id), None)
-    if not event: return jsonify({'error':'Event not found'}), 404
-    event['status']='cancelled'
-    return jsonify({'ok':True})
+@app.post('/api/ai/event-summary')
+def ai_summary():
+    data = request.json or {}
+    description = data.get('description', '')
+    summary = ai.generate_event_summary(description)
+    if summary is None:
+        return jsonify({'error': 'AI unavailable'}), 503
+    return jsonify({'summary': summary})
 
-if __name__ == '__main__': app.run(debug=True, port=5000)
+@app.post('/api/ai/assistant')
+def ai_assistant():
+    data = request.json or {}
+    question = data.get('question', '')
+    conn = db.get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, title, description, category, event_date, venue FROM events WHERE status='published'")
+    events = [dict(row) for row in c.fetchall()]
+    conn.close()
+    
+    answer = ai.answer_discovery_question(question, events)
+    if answer is None:
+        return jsonify({'error': 'AI unavailable'}), 503
+    return jsonify({'answer': answer})
+
+if __name__ == '__main__':
+    db.init_db()
+    app.run(debug=True, port=5000)
